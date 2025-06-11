@@ -1,0 +1,76 @@
+import snowflake.connector
+
+# Step 1: Connect to Snowflake
+conn = snowflake.connector.connect(
+    user='amaldona10@chewy.com',
+    account='chewy.us-east-1',
+    authenticator='externalbrowser',
+    warehouse='CF_WH',
+    database='EDLDB',
+    schema='PUBLIC',
+    validate_default_parameters=False
+)
+
+# Step 2: SQL query
+query = """
+WITH invoice_po_allocation AS (
+    SELECT 
+        ish.invoice_id,
+        ish.invoice_number,
+        ish.invoice_create_dttm,
+        pot.purchase_order,
+        it.shipment_id,
+        it.transport_mode,
+        it.source_loc_id,
+        it.destination_location_id,
+        ish.voucher_amount_to_pay,
+        SUM(CASE WHEN isit.cost_type = 'B' THEN isit.freight_charge_amount ELSE 0 END) AS inv_base,
+        SUM(CASE WHEN isit.cost_type = 'A' AND isit.accessorial_code IN ('CHEWY.BAF','CHEWY.MSG') THEN isit.freight_charge_amount ELSE 0 END) AS inv_fuel,
+        SUM(CASE WHEN isit.cost_type = 'A' AND isit.accessorial_code NOT IN ('CHEWY.BAF','CHEWY.MSG') THEN isit.freight_charge_amount ELSE 0 END) AS inv_other
+    FROM chewybi.inbound_shipment_invoice_transactions AS isit
+    JOIN chewybi.inbound_shipment_invoice_header AS ish USING (invoice_id)
+    JOIN chewybi.inbound_transportation AS it ON it.shipment_id = isit.shipment_id
+    JOIN chewybi.inbound_shipment_purchase_order_transactions AS pot ON pot.shipment_id = it.shipment_id
+    WHERE it.transport_mode IN ('VESSEL-CO', 'DRAYAGE', 'LTL', 'TL', 'INTRMDL')
+      AND ish.voucher_xid IS NOT NULL
+      AND ish.invoice_create_dttm BETWEEN DATE '2023-01-01' AND DATE '2025-06-10'
+    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
+)
+
+SELECT 
+    purchase_order,
+    invoice_number,
+    invoice_create_dttm,
+    transport_mode,
+    source_loc_id,
+    destination_location_id,
+    shipment_id,
+    inv_base + inv_fuel + inv_other AS total_allocated_cost,
+    voucher_amount_to_pay,
+    CASE 
+        WHEN ROUND(inv_base + inv_fuel + inv_other, 2) = ROUND(voucher_amount_to_pay, 2)
+        THEN 'MATCH'
+        ELSE 'MISMATCH'
+    END AS allocation_check
+FROM invoice_po_allocation
+ORDER BY purchase_order, invoice_create_dttm, invoice_number;
+"""
+
+# Step 3: Execute and print preview
+cursor = conn.cursor()
+try:
+    cursor.execute(query)
+    columns = [col[0] for col in cursor.description]
+    results = cursor.fetchall()
+
+    print(f"\n✅ Query returned {len(results)} rows.")
+
+    # Print preview
+    for i, row in enumerate(results[:10]):
+        print(f"\nRow {i+1}")
+        for col, val in zip(columns, row):
+            print(f"{col}: {val}")
+
+finally:
+    cursor.close()
+    conn.close()
