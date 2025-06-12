@@ -1,0 +1,137 @@
+import csv
+import snowflake.connector
+import xlsxwriter
+
+# === Step 1: Load ERP CSV ===
+erp_csv_path = r"C:\Users\amaldona10\OneDrive - Chewy.com, LLC\Desktop\Python Exports\oracle_erp_data.csv"
+with open(erp_csv_path, newline='', encoding='utf-8') as csvfile:
+    reader = csv.DictReader(csvfile)
+    erp_data = list(reader)
+
+# Normalize ERP invoice numbers (remove commas, strip leading zeros)
+erp_lookup = {}
+for row in erp_data:
+    raw = row["Invoice Number"]
+    if raw:
+        clean = raw.replace(",", "").lstrip("0")
+        erp_lookup[clean] = row
+
+# === Step 2: Connect to Snowflake and Run Query ===
+conn = snowflake.connector.connect(
+    user='amaldona10@chewy.com',
+    account='chewy.us-east-1',
+    authenticator='externalbrowser',
+    warehouse='CF_WH',
+    database='EDLDB',
+    schema='PUBLIC',
+    validate_default_parameters=False
+)
+
+query = """
+WITH invoice_po_allocation AS (
+    SELECT 
+        ish.invoice_id,
+        ish.invoice_number,
+        ish.invoice_create_dttm,
+        pot.purchase_order,
+        it.shipment_id,
+        it.transport_mode,
+        it.source_loc_id,
+        it.destination_location_id,
+        ish.voucher_amount_to_pay,
+        SUM(CASE WHEN isit.cost_type = 'B' THEN isit.freight_charge_amount ELSE 0 END) AS inv_base,
+        SUM(CASE WHEN isit.cost_type = 'A' AND isit.accessorial_code IN ('CHEWY.BAF','CHEWY.MSG') THEN isit.freight_charge_amount ELSE 0 END) AS inv_fuel,
+        SUM(CASE WHEN isit.cost_type = 'A' AND isit.accessorial_code NOT IN ('CHEWY.BAF','CHEWY.MSG') THEN isit.freight_charge_amount ELSE 0 END) AS inv_other
+    FROM chewybi.inbound_shipment_invoice_transactions AS isit
+    JOIN chewybi.inbound_shipment_invoice_header AS ish USING (invoice_id)
+    JOIN chewybi.inbound_transportation AS it ON it.shipment_id = isit.shipment_id
+    JOIN chewybi.inbound_shipment_purchase_order_transactions AS pot ON pot.shipment_id = it.shipment_id
+    WHERE it.transport_mode IN ('VESSEL-CO', 'DRAYAGE', 'LTL', 'TL', 'INTRMDL')
+      AND ish.voucher_xid IS NOT NULL
+      AND ish.invoice_create_dttm BETWEEN DATE '2023-01-01' AND DATE '2025-06-10'
+    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
+)
+SELECT 
+    purchase_order,
+    invoice_number,
+    invoice_create_dttm,
+    transport_mode,
+    source_loc_id,
+    destination_location_id,
+    shipment_id,
+    inv_base + inv_fuel + inv_other AS total_allocated_cost,
+    voucher_amount_to_pay,
+    CASE 
+        WHEN ROUND(inv_base + inv_fuel + inv_other, 2) = ROUND(voucher_amount_to_pay, 2)
+        THEN 'MATCH'
+        ELSE 'MISMATCH'
+    END AS allocation_check
+FROM invoice_po_allocation
+ORDER BY purchase_order, invoice_create_dttm, invoice_number;
+"""
+
+cursor = conn.cursor()
+cursor.execute(query)
+columns = [col[0] for col in cursor.description]
+results = cursor.fetchall()
+cursor.close()
+conn.close()
+
+# === Step 3: Normalize and Match Invoice Numbers ===
+sf_lookup = {}
+for row in results:
+    row_dict = dict(zip(columns, row))
+    clean_invoice = row_dict["INVOICE_NUMBER"].replace("-", "").lstrip("0")
+    sf_lookup[clean_invoice] = row_dict
+
+# === Step 4: Build Final Report ===
+headers = [
+    "INVOICE_NUMBER", "shipment_id", "purchase_order", "invoice_create_dttm",
+    "total_allocated_cost", "voucher_amount_to_pay",
+    "erp_invoice_amount", "erp_unpaid_amount", "payment_status"
+]
+
+final_rows = []
+for clean_invoice, erp_row in erp_lookup.items():
+    sf_row = sf_lookup.get(clean_invoice)
+    if sf_row:
+        unpaid_str = (erp_row.get("Unpaid Amount") or "0").replace(",", "")
+        unpaid = float(unpaid_str)
+        status = "Unpaid" if unpaid > 0 else "Paid"
+        final_rows.append([
+            sf_row["INVOICE_NUMBER"],
+            sf_row["SHIPMENT_ID"],
+            sf_row["PURCHASE_ORDER"],
+            sf_row["INVOICE_CREATE_DTTM"],
+            sf_row["TOTAL_ALLOCATED_COST"],
+            sf_row["VOUCHER_AMOUNT_TO_PAY"],
+            erp_row.get("Invoice Amount", ""),
+            erp_row.get("Unpaid Amount", ""),
+            status
+        ])
+    else:
+        final_rows.append([
+            erp_row.get("Invoice Number", ""),
+            "", "", "", "", "",
+            erp_row.get("Invoice Amount", ""),
+            erp_row.get("Unpaid Amount", ""),
+            "Not in Snowflake"
+        ])
+
+# === Step 5: Export to Excel ===
+output_path = r"C:\Users\amaldona10\OneDrive - Chewy.com, LLC\Desktop\Python Exports\invoice_number_only_report.xlsx"
+workbook = xlsxwriter.Workbook(output_path)
+worksheet = workbook.add_worksheet("Invoice Match Only")
+
+# Write headers
+for col_idx, col in enumerate(headers):
+    worksheet.write(0, col_idx, col)
+
+# Write rows
+for row_idx, row in enumerate(final_rows, start=1):
+    for col_idx, val in enumerate(row):
+        worksheet.write(row_idx, col_idx, val)
+
+workbook.close()
+
+print(f"\n✅ Report exported to: {output_path}")
